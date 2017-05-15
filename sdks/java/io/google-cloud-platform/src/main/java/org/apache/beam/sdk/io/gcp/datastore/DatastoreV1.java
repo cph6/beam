@@ -82,6 +82,7 @@ import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.transforms.display.DisplayData.Builder;
@@ -89,6 +90,7 @@ import org.apache.beam.sdk.transforms.display.HasDisplayData;
 import org.apache.beam.sdk.util.BackOff;
 import org.apache.beam.sdk.util.BackOffUtils;
 import org.apache.beam.sdk.util.FluentBackoff;
+import org.apache.beam.sdk.util.MovingFunction;
 import org.apache.beam.sdk.util.RetryHttpRequestInitializer;
 import org.apache.beam.sdk.util.Sleeper;
 import org.apache.beam.sdk.values.KV;
@@ -206,6 +208,22 @@ public class DatastoreV1 {
    */
   @VisibleForTesting
   static final int DATASTORE_BATCH_UPDATE_LIMIT = 500;
+
+  /**
+   * Target time per RPC for writes. The batch size is adjusted dynamically
+   * based on the latency of previous RPCs to achieve this. This avoids us
+   * sending over-large requests full of expensive entity writes that may
+   * timeout before the server can apply them all.
+   */
+  static final int DATASTORE_BATCH_TARGET_LATENCY_MS = 5000;
+
+  /**
+   * When dynamically determining the number of updates in a single RPC, never
+   * go below this many entities per request.
+   * The actual number of entities per request may be lower if we flush for the
+   * end of a bundle.
+   */
+  static final int DATASTORE_BATCH_UPDATE_LIMIT = 10;
 
   /**
    * Cloud Datastore has a limit of 10MB per RPC, so we also flush if the total size of mutations
@@ -1137,6 +1155,11 @@ public class DatastoreV1 {
     private static final FluentBackoff BUNDLE_WRITE_BACKOFF =
         FluentBackoff.DEFAULT
             .withMaxRetries(MAX_RETRIES).withInitialBackoff(Duration.standardSeconds(5));
+    private final MovingAverage meanLatencyPerEntityMs = new MovingAverage(
+        300000 /* sample period 5 minutes */, 10000 /* sample interval 10s */,
+        1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
+    private int nextBatchSize = DATASTORE_BATCH_UPDATE_LIMIT;
+
 
     DatastoreWriterFn(String projectId, @Nullable String localhost) {
       this(StaticValueProvider.of(projectId), localhost, new V1DatastoreFactory());
@@ -1169,7 +1192,7 @@ public class DatastoreV1 {
       }
       mutations.add(c.element());
       mutationsSize += size;
-      if (mutations.size() >= DatastoreV1.DATASTORE_BATCH_UPDATE_LIMIT) {
+      if (mutations.size() >= nextBatchSize) {
         flushBatch();
       }
     }
@@ -1193,7 +1216,7 @@ public class DatastoreV1 {
      * backing off between retries fails.
      */
     private void flushBatch() throws DatastoreException, IOException, InterruptedException {
-      LOG.debug("Writing batch of {} mutations", mutations.size());
+      LOG.info("Writing batch of {} mutations", mutations.size());
       Sleeper sleeper = Sleeper.DEFAULT;
       BackOff backoff = BUNDLE_WRITE_BACKOFF.backoff();
 
@@ -1203,7 +1226,21 @@ public class DatastoreV1 {
           CommitRequest.Builder commitRequest = CommitRequest.newBuilder();
           commitRequest.addAllMutations(mutations);
           commitRequest.setMode(CommitRequest.Mode.NON_TRANSACTIONAL);
+          long startTime = System.currentTimeMillis();
           datastore.commit(commitRequest.build());
+          long endTime = System.currentTimeMillis();
+
+          meanLatencyPerEntityMs.add(endTime, (endTime - startTime) / mutations.size());
+          if (meanLatencyPerEntityMs.hasValue()) {
+            nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_MIN, 
+              Math.max(DATASTORE_BATCH_UPDATE_LIMIT,
+                DATASTORE_BATCH_TARGET_LATENCY_MS / meanLatencyPerEntityMs.get(endTime)));
+          }
+
+          // DO NOT COMMIT
+          LOG.info("sum={} count={} sumIS={} countIS={} next={}", latencySum.get(endTime),
+              latencyCount.get(endTime), latencySum.isSignificant(), latencyCount.isSignificant(),
+              nextBatchSize);
           // Break if the commit threw no exception.
           break;
         } catch (DatastoreException exception) {
@@ -1217,7 +1254,8 @@ public class DatastoreV1 {
           }
         }
       }
-      LOG.debug("Successfully wrote {} mutations", mutations.size());
+      // DO NOT COMMIT as info?
+      LOG.info("Successfully wrote {} mutations", mutations.size());
       mutations.clear();
       mutationsSize = 0;
     }

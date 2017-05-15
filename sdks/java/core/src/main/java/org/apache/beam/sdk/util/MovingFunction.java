@@ -20,6 +20,7 @@ package org.apache.beam.sdk.util;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
+import java.io.Serializable;
 import java.util.Arrays;
 import org.apache.beam.sdk.transforms.Combine;
 
@@ -28,7 +29,7 @@ import org.apache.beam.sdk.transforms.Combine;
  * is over at most the user-specified last {@code samplePeriodMs}, and is updated every
  * {@code sampleUpdateMs}.
  */
-public class MovingFunction {
+public class MovingFunction implements Serializable {
   /**
    * How frequently to update the moving function, in ms.
    */
