@@ -82,7 +82,6 @@ import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SimpleFunction;
-import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.transforms.display.DisplayData.Builder;
@@ -90,7 +89,6 @@ import org.apache.beam.sdk.transforms.display.HasDisplayData;
 import org.apache.beam.sdk.util.BackOff;
 import org.apache.beam.sdk.util.BackOffUtils;
 import org.apache.beam.sdk.util.FluentBackoff;
-import org.apache.beam.sdk.util.MovingFunction;
 import org.apache.beam.sdk.util.RetryHttpRequestInitializer;
 import org.apache.beam.sdk.util.Sleeper;
 import org.apache.beam.sdk.values.KV;
@@ -223,7 +221,7 @@ public class DatastoreV1 {
    * The actual number of entities per request may be lower if we flush for the
    * end of a bundle.
    */
-  static final int DATASTORE_BATCH_UPDATE_LIMIT = 10;
+  static final int DATASTORE_BATCH_UPDATE_MIN = 10;
 
   /**
    * Cloud Datastore has a limit of 10MB per RPC, so we also flush if the total size of mutations
@@ -1158,7 +1156,10 @@ public class DatastoreV1 {
     private final MovingAverage meanLatencyPerEntityMs = new MovingAverage(
         300000 /* sample period 5 minutes */, 10000 /* sample interval 10s */,
         1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
-    private int nextBatchSize = DATASTORE_BATCH_UPDATE_LIMIT;
+    // Testing has found that a batch of 200 entities will generally finish
+    // within the timeout even in adverse conditions.  On subsequent requests
+    // we will adapt based on past performance.
+    private int nextBatchSize = 200;
 
 
     DatastoreWriterFn(String projectId, @Nullable String localhost) {
@@ -1204,6 +1205,16 @@ public class DatastoreV1 {
       }
     }
 
+    private void updateNextBatchSize(long nowSinceEpochMs) {
+      if (!meanLatencyPerEntityMs.hasValue(nowSinceEpochMs)) {
+        return;
+      }
+      long recentMeanLatency = Math.max(meanLatencyPerEntityMs.get(nowSinceEpochMs), 1);
+      nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_MIN,
+          Math.min(DATASTORE_BATCH_UPDATE_LIMIT,
+            DATASTORE_BATCH_TARGET_LATENCY_MS / recentMeanLatency));
+    }
+
     /**
      * Writes a batch of mutations to Cloud Datastore.
      *
@@ -1231,16 +1242,10 @@ public class DatastoreV1 {
           long endTime = System.currentTimeMillis();
 
           meanLatencyPerEntityMs.add(endTime, (endTime - startTime) / mutations.size());
-          if (meanLatencyPerEntityMs.hasValue()) {
-            nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_MIN, 
-              Math.max(DATASTORE_BATCH_UPDATE_LIMIT,
-                DATASTORE_BATCH_TARGET_LATENCY_MS / meanLatencyPerEntityMs.get(endTime)));
-          }
+          updateNextBatchSize(endTime);
 
           // DO NOT COMMIT
-          LOG.info("sum={} count={} sumIS={} countIS={} next={}", latencySum.get(endTime),
-              latencyCount.get(endTime), latencySum.isSignificant(), latencyCount.isSignificant(),
-              nextBatchSize);
+          LOG.info("mean={} next={}", meanLatencyPerEntityMs.get(endTime), nextBatchSize);
           // Break if the commit threw no exception.
           break;
         } catch (DatastoreException exception) {
