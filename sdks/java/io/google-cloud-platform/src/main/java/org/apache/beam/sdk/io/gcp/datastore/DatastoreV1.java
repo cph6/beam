@@ -200,28 +200,39 @@ public class DatastoreV1 {
   // A package-private constructor to prevent direct instantiation from outside of this package
   DatastoreV1() {}
 
-  /**
-   * Cloud Datastore has a limit of 500 mutations per batch operation, so we flush
-   * changes to Datastore every 500 entities.
+  /** The number of entity updates written per RPC, initially. We buffer
+   * updates in the connector and write a batch of updates to Datastore once we
+   * have this many writes. This is the initial batch size; it is adjusted at
+   * runtime based on the performance of previous writes (see
+   * DATASTORE_BATCH_TARGET_LATENCY_MS).
+   *
+   * <p>Testing has found that a batch of 200 entities will generally finish
+   * within the timeout even in adverse conditions.
    */
   @VisibleForTesting
-  static final int DATASTORE_BATCH_UPDATE_LIMIT = 500;
+  static final int DATASTORE_BATCH_UPDATE_ENTITIES_START = 200;
 
   /**
-   * Target time per RPC for writes. The batch size is adjusted dynamically
-   * based on the latency of previous RPCs to achieve this. This avoids us
-   * sending over-large requests full of expensive entity writes that may
-   * timeout before the server can apply them all.
+   * Target time per RPC for writes. The number of updates per RPC is adjusted
+   * dynamically based on the latency of previous RPCs to achieve this. This
+   * avoids us sending over-large requests full of expensive entity writes that
+   * may timeout before the server can apply them all.
    */
   static final int DATASTORE_BATCH_TARGET_LATENCY_MS = 5000;
 
   /**
-   * When dynamically determining the number of updates in a single RPC, never
-   * go below this many entities per request.
-   * The actual number of entities per request may be lower if we flush for the
-   * end of a bundle.
+   * When dynamically adjusting the number of updates in a single RPC, never
+   * exceed this value.  500 is the maximum allowed by the API.
    */
-  static final int DATASTORE_BATCH_UPDATE_MIN = 10;
+  static final int DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT = 500;
+
+  /**
+   * When dynamically determining the number of updates in a single RPC, never
+   * go below this value.  The actual number of entities per request may be
+   * lower if we flush for the end of a bundle or if we hit the
+   * DATASTORE_BATCH_UPDATE_BYTES_LIMIT below.
+   */
+  static final int DATASTORE_BATCH_UPDATE_ENTITIES_MIN = 10;
 
   /**
    * Cloud Datastore has a limit of 10MB per RPC, so we also flush if the total size of mutations
@@ -1125,14 +1136,16 @@ public class DatastoreV1 {
 
   /**
    * {@link DoFn} that writes {@link Mutation}s to Cloud Datastore. Mutations are written in
-   * batches, where the maximum batch size is {@link DatastoreV1#DATASTORE_BATCH_UPDATE_LIMIT}.
+   * batches, where the target batch size is in nextBatchSize; this starts at
+   * {@link DatastoreV1#DATASTORE_BATCH_UPDATE_ENTITIES_START} but is adjusted
+   * based on the performance of past RPCs.
    *
    * <p>See <a
    * href="https://cloud.google.com/datastore/docs/concepts/entities">
    * Datastore: Entities, Properties, and Keys</a> for information about entity keys and mutations.
    *
    * <p>Commits are non-transactional.  If a commit fails because of a conflict over an entity
-   * group, the commit will be retried (up to {@link DatastoreV1#DATASTORE_BATCH_UPDATE_LIMIT}
+   * group, the commit will be retried (up to {@link DatastoreV1.DatastoreWriterFn#MAX_RETRIES}
    * times). This means that the mutation operation should be idempotent. Thus, the writer should
    * only be used for {code upsert} and {@code delete} mutation operations, as these are the only
    * two Cloud Datastore mutations that are idempotent.
@@ -1153,34 +1166,38 @@ public class DatastoreV1 {
     private static final FluentBackoff BUNDLE_WRITE_BACKOFF =
         FluentBackoff.DEFAULT
             .withMaxRetries(MAX_RETRIES).withInitialBackoff(Duration.standardSeconds(5));
-    private final MovingAverage meanLatencyPerEntityMs = new MovingAverage(
-        300000 /* sample period 5 minutes */, 10000 /* sample interval 10s */,
-        1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
-    // Testing has found that a batch of 200 entities will generally finish
-    // within the timeout even in adverse conditions.  On subsequent requests
-    // we will adapt based on past performance.
-    private int nextBatchSize = 200;
-
+    // Whether we are dynamically updating nextBatchSize based on the
+    // performance of past requests.
+    private final boolean adjustBatchSize;
+    private MovingAverage meanLatencyPerEntityMs;
+    // How many entities to include in the next batch update.
+    private int nextBatchSize = DATASTORE_BATCH_UPDATE_ENTITIES_START;
 
     DatastoreWriterFn(String projectId, @Nullable String localhost) {
-      this(StaticValueProvider.of(projectId), localhost, new V1DatastoreFactory());
+      this(StaticValueProvider.of(projectId), localhost, new V1DatastoreFactory(), true);
     }
 
     DatastoreWriterFn(ValueProvider<String> projectId, @Nullable String localhost) {
-      this(projectId, localhost, new V1DatastoreFactory());
+      this(projectId, localhost, new V1DatastoreFactory(), true);
     }
 
     @VisibleForTesting
     DatastoreWriterFn(ValueProvider<String> projectId, @Nullable String localhost,
-        V1DatastoreFactory datastoreFactory) {
+        V1DatastoreFactory datastoreFactory, boolean adjustBatchSize) {
       this.projectId = checkNotNull(projectId, "projectId");
       this.localhost = localhost;
       this.datastoreFactory = datastoreFactory;
+      this.adjustBatchSize = adjustBatchSize;
     }
 
     @StartBundle
     public void startBundle(StartBundleContext c) {
       datastore = datastoreFactory.getDatastore(c.getPipelineOptions(), projectId.get(), localhost);
+      if (adjustBatchSize) {
+        meanLatencyPerEntityMs = new MovingAverage(
+            120000 /* sample period 2 minutes */, 10000 /* sample interval 10s */,
+            1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
+      }
     }
 
     @ProcessElement
@@ -1210,8 +1227,8 @@ public class DatastoreV1 {
         return;
       }
       long recentMeanLatency = Math.max(meanLatencyPerEntityMs.get(nowSinceEpochMs), 1);
-      nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_MIN,
-          Math.min(DATASTORE_BATCH_UPDATE_LIMIT,
+      nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_ENTITIES_MIN,
+          Math.min(DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT,
             DATASTORE_BATCH_TARGET_LATENCY_MS / recentMeanLatency));
     }
 
@@ -1241,11 +1258,13 @@ public class DatastoreV1 {
           datastore.commit(commitRequest.build());
           long endTime = System.currentTimeMillis();
 
-          meanLatencyPerEntityMs.add(endTime, (endTime - startTime) / mutations.size());
-          updateNextBatchSize(endTime);
+          if (adjustBatchSize) {
+            meanLatencyPerEntityMs.add(endTime, (endTime - startTime) / mutations.size());
+            updateNextBatchSize(endTime);
+            // DO NOT COMMIT
+            LOG.info("mean={} next={}", meanLatencyPerEntityMs.get(endTime), nextBatchSize);
+          }
 
-          // DO NOT COMMIT
-          LOG.info("mean={} next={}", meanLatencyPerEntityMs.get(endTime), nextBatchSize);
           // Break if the commit threw no exception.
           break;
         } catch (DatastoreException exception) {
