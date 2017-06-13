@@ -1,11 +1,10 @@
 package org.apache.beam.sdk.io.gcp.datastore;
 
-import java.io.Serializable;
 import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.util.MovingFunction;
 
 
-class MovingAverage implements Serializable {
+class MovingAverage {
   private final MovingFunction sum;
   private final MovingFunction count;
 
