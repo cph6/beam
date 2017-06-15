@@ -216,6 +216,7 @@ public class DatastoreV1 {
    * When dynamically adjusting the number of updates in a single RPC, never
    * exceed this value.  500 is the maximum allowed by the API.
    */
+  @VisibleForTesting
   static final int DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT = 500;
 
   /**
@@ -224,6 +225,7 @@ public class DatastoreV1 {
    * lower if we flush for the end of a bundle or if we hit the
    * DATASTORE_BATCH_UPDATE_BYTES_LIMIT below.
    */
+  @VisibleForTesting
   static final int DATASTORE_BATCH_UPDATE_ENTITIES_MIN = 10;
 
   /**
@@ -1129,6 +1131,7 @@ public class DatastoreV1 {
   /**
    * Determines batch sizes for commit RPCs.
    */
+  @VisibleForTesting
   interface WriteBatcher {
     /**
      * Call before using this WriteBatcher.

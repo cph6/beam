@@ -628,7 +628,7 @@ public class DatastoreV1Test {
     }
 
     DatastoreWriterFn datastoreWriter = new DatastoreWriterFn(StaticValueProvider.of(PROJECT_ID),
-        null, mockDatastoreFactory, new DatastoreV1.FakeWriteBatcher());
+        null, mockDatastoreFactory, new FakeWriteBatcher());
     DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
     doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
     doFnTester.processBundle(mutations);
@@ -662,7 +662,7 @@ public class DatastoreV1Test {
     }
 
     DatastoreWriterFn datastoreWriter = new DatastoreWriterFn(StaticValueProvider.of(PROJECT_ID),
-        null, mockDatastoreFactory, new DatastoreV1.FakeWriteBatcher());
+        null, mockDatastoreFactory, new FakeWriteBatcher());
     DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
     doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
     doFnTester.processBundle(mutations);
@@ -896,6 +896,50 @@ public class DatastoreV1Test {
         .apply(DatastoreIO.v1().write().withProjectId(options.getDatastoreProject()));
   }
 
+  @Test
+  public void testWriteBatcherWithoutData() {
+    DatastoreV1.WriteBatcher writeBatcher = new DatastoreV1.WriteBatcherImpl();
+    writeBatcher.start();
+    assertEquals(DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_START, writeBatcher.nextBatchSize(0));
+  }
+
+  @Test
+  public void testWriteBatcherFastQueries() {
+    DatastoreV1.WriteBatcher writeBatcher = new DatastoreV1.WriteBatcherImpl();
+    writeBatcher.start();
+    writeBatcher.addRequestLatency(0, 1000, 200);
+    writeBatcher.addRequestLatency(0, 1000, 200);
+    assertEquals(DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT, writeBatcher.nextBatchSize(0));
+  }
+
+  @Test
+  public void testWriteBatcherSlowQueries() {
+    DatastoreV1.WriteBatcher writeBatcher = new DatastoreV1.WriteBatcherImpl();
+    writeBatcher.start();
+    writeBatcher.addRequestLatency(0, 10000, 200);
+    writeBatcher.addRequestLatency(0, 10000, 200);
+    assertEquals(100, writeBatcher.nextBatchSize(0));
+  }
+
+  @Test
+  public void testWriteBatcherSizeNotBelowMinimum() {
+    DatastoreV1.WriteBatcher writeBatcher = new DatastoreV1.WriteBatcherImpl();
+    writeBatcher.start();
+    writeBatcher.addRequestLatency(0, 30000, 50);
+    writeBatcher.addRequestLatency(0, 30000, 50);
+    assertEquals(DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_MIN, writeBatcher.nextBatchSize(0));
+  }
+
+  @Test
+  public void testWriteBatcherSlidingWindow() {
+    DatastoreV1.WriteBatcher writeBatcher = new DatastoreV1.WriteBatcherImpl();
+    writeBatcher.start();
+    writeBatcher.addRequestLatency(0, 30000, 50);
+    writeBatcher.addRequestLatency(50000, 5000, 200);
+    writeBatcher.addRequestLatency(100000, 5000, 200);
+    assertEquals(200, writeBatcher.nextBatchSize(150000));
+  }
+
   /** Helper Methods */
 
   /** A helper function that verifies if all the queries have unique keys. */
@@ -1038,5 +1082,21 @@ public class DatastoreV1Test {
       queries.add(query.toBuilder().clone().build());
     }
     return queries;
+  }
+
+  /**
+   * A WriteBatcher for unit tests, which does no timing-based adjustments (so
+   * unit tests have consistent results).
+   */
+  static class FakeWriteBatcher implements DatastoreV1.WriteBatcher {
+    @Override
+    public void start() {}
+    @Override
+    public void addRequestLatency(long timeSinceEpochMillis, long latencyMillis, int numMutations) {
+    }
+    @Override
+    public int nextBatchSize(long timeSinceEpochMillis) {
+      return DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_START;
+    }
   }
 }
