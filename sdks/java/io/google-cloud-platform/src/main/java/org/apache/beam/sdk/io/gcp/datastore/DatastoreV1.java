@@ -213,14 +213,6 @@ public class DatastoreV1 {
   static final int DATASTORE_BATCH_UPDATE_ENTITIES_START = 200;
 
   /**
-   * Target time per RPC for writes. The number of updates per RPC is adjusted
-   * dynamically based on the latency of previous RPCs to achieve this. This
-   * avoids us sending over-large requests full of expensive entity writes that
-   * may timeout before the server can apply them all.
-   */
-  static final int DATASTORE_BATCH_TARGET_LATENCY_MS = 5000;
-
-  /**
    * When dynamically adjusting the number of updates in a single RPC, never
    * exceed this value.  500 is the maximum allowed by the API.
    */
@@ -1135,6 +1127,86 @@ public class DatastoreV1 {
   }
 
   /**
+   * Determines batch sizes for commit RPCs.
+   */
+  interface WriteBatcher {
+    /**
+     * Call before using this WriteBatcher.
+     */
+    void start();
+
+    /**
+     * Reports the latency of a previous commit RPC, and the number of mutations that it contained.
+     */
+    void addRequestLatency(long timeSinceEpochMillis, long latencyMillis, int numMutations);
+
+    /**
+     * Returns the number of entities to include in the next CommitRequest.
+     */
+    int nextBatchSize(long timeSinceEpochMillis);
+  }
+
+  /**
+   * A WriteBatcher for unit tests, which does no timing-based adjustments (so
+   * unit tests have consistent results).
+   */
+  static class FakeWriteBatcher implements WriteBatcher, Serializable {
+    @Override
+    public void start() {}
+    @Override
+    public void addRequestLatency(long timeSinceEpochMillis, long latencyMillis, int numMutations) {
+    }
+    @Override
+    public int nextBatchSize(long timeSinceEpochMillis) {
+      return DATASTORE_BATCH_UPDATE_ENTITIES_START;
+    }
+  }
+
+  /**
+   * Determines batch sizes for commit RPCs based on past performance.
+   */
+  @VisibleForTesting
+  static class WriteBatcherImpl implements WriteBatcher, Serializable {
+    /**
+     * Target time per RPC for writes. The number of updates per RPC is adjusted
+     * dynamically based on the latency of previous RPCs to achieve this. This
+     * avoids us sending over-large requests full of expensive entity writes that
+     * may timeout before the server can apply them all.
+     */
+    static final int DATASTORE_BATCH_TARGET_LATENCY_MS = 5000;
+
+    // DO NOT SUBMIT.
+    private static final Logger LOG = LoggerFactory.getLogger(DatastoreWriterFn.class);
+
+    @Override
+    public void start() {
+      meanLatencyPerEntityMs = new MovingAverage(
+          120000 /* sample period 2 minutes */, 10000 /* sample interval 10s */,
+          1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
+    }
+
+    @Override
+    public void addRequestLatency(long timeSinceEpochMillis, long latencyMillis, int numMutations) {
+      meanLatencyPerEntityMs.add(timeSinceEpochMillis, latencyMillis / numMutations);
+    }
+
+    @Override
+    public int nextBatchSize(long timeSinceEpochMillis) {
+      if (!meanLatencyPerEntityMs.hasValue(timeSinceEpochMillis)) {
+        return DATASTORE_BATCH_UPDATE_ENTITIES_START;
+      }
+      long recentMeanLatency = Math.max(meanLatencyPerEntityMs.get(timeSinceEpochMillis), 1);
+      // DO NOT COMMIT
+      LOG.info("mean={}", meanLatencyPerEntityMs.get(timeSinceEpochMillis));
+      return (int) Math.max(DATASTORE_BATCH_UPDATE_ENTITIES_MIN,
+          Math.min(DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT,
+            DATASTORE_BATCH_TARGET_LATENCY_MS / recentMeanLatency));
+    }
+
+    private transient MovingAverage meanLatencyPerEntityMs;
+  }
+
+  /**
    * {@link DoFn} that writes {@link Mutation}s to Cloud Datastore. Mutations are written in
    * batches, where the target batch size is in nextBatchSize; this starts at
    * {@link DatastoreV1#DATASTORE_BATCH_UPDATE_ENTITIES_START} but is adjusted
@@ -1161,43 +1233,35 @@ public class DatastoreV1 {
     // Current batch of mutations to be written.
     private final List<Mutation> mutations = new ArrayList<>();
     private int mutationsSize = 0;  // Accumulated size of protos in mutations.
+    private WriteBatcher writeBatcher;
 
     private static final int MAX_RETRIES = 5;
     private static final FluentBackoff BUNDLE_WRITE_BACKOFF =
         FluentBackoff.DEFAULT
             .withMaxRetries(MAX_RETRIES).withInitialBackoff(Duration.standardSeconds(5));
-    // Whether we are dynamically updating nextBatchSize based on the
-    // performance of past requests.
-    private final boolean adjustBatchSize;
-    private MovingAverage meanLatencyPerEntityMs;
-    // How many entities to include in the next batch update.
-    private int nextBatchSize = DATASTORE_BATCH_UPDATE_ENTITIES_START;
 
     DatastoreWriterFn(String projectId, @Nullable String localhost) {
-      this(StaticValueProvider.of(projectId), localhost, new V1DatastoreFactory(), true);
+      this(StaticValueProvider.of(projectId), localhost, new V1DatastoreFactory(),
+          new WriteBatcherImpl());
     }
 
     DatastoreWriterFn(ValueProvider<String> projectId, @Nullable String localhost) {
-      this(projectId, localhost, new V1DatastoreFactory(), true);
+      this(projectId, localhost, new V1DatastoreFactory(), new WriteBatcherImpl());
     }
 
     @VisibleForTesting
     DatastoreWriterFn(ValueProvider<String> projectId, @Nullable String localhost,
-        V1DatastoreFactory datastoreFactory, boolean adjustBatchSize) {
+        V1DatastoreFactory datastoreFactory, WriteBatcher writeBatcher) {
       this.projectId = checkNotNull(projectId, "projectId");
       this.localhost = localhost;
       this.datastoreFactory = datastoreFactory;
-      this.adjustBatchSize = adjustBatchSize;
+      this.writeBatcher = writeBatcher;
     }
 
     @StartBundle
     public void startBundle(StartBundleContext c) {
       datastore = datastoreFactory.getDatastore(c.getPipelineOptions(), projectId.get(), localhost);
-      if (adjustBatchSize) {
-        meanLatencyPerEntityMs = new MovingAverage(
-            120000 /* sample period 2 minutes */, 10000 /* sample interval 10s */,
-            1 /* numSignificantBuckets */, 1 /* numSignificantSamples */);
-      }
+      writeBatcher.start();
     }
 
     @ProcessElement
@@ -1210,7 +1274,7 @@ public class DatastoreV1 {
       }
       mutations.add(c.element());
       mutationsSize += size;
-      if (mutations.size() >= nextBatchSize) {
+      if (mutations.size() >= writeBatcher.nextBatchSize(System.currentTimeMillis())) {
         flushBatch();
       }
     }
@@ -1220,16 +1284,6 @@ public class DatastoreV1 {
       if (!mutations.isEmpty()) {
         flushBatch();
       }
-    }
-
-    private void updateNextBatchSize(long nowSinceEpochMs) {
-      if (!meanLatencyPerEntityMs.hasValue(nowSinceEpochMs)) {
-        return;
-      }
-      long recentMeanLatency = Math.max(meanLatencyPerEntityMs.get(nowSinceEpochMs), 1);
-      nextBatchSize = (int) Math.max(DATASTORE_BATCH_UPDATE_ENTITIES_MIN,
-          Math.min(DATASTORE_BATCH_UPDATE_ENTITIES_LIMIT,
-            DATASTORE_BATCH_TARGET_LATENCY_MS / recentMeanLatency));
     }
 
     /**
@@ -1258,12 +1312,7 @@ public class DatastoreV1 {
           datastore.commit(commitRequest.build());
           long endTime = System.currentTimeMillis();
 
-          if (adjustBatchSize) {
-            meanLatencyPerEntityMs.add(endTime, (endTime - startTime) / mutations.size());
-            updateNextBatchSize(endTime);
-            // DO NOT COMMIT
-            LOG.info("mean={} next={}", meanLatencyPerEntityMs.get(endTime), nextBatchSize);
-          }
+          writeBatcher.addRequestLatency(endTime, endTime - startTime, mutations.size());
 
           // Break if the commit threw no exception.
           break;
